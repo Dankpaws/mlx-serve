@@ -5670,3 +5670,10 @@ Defect: the first copy chain of 15 drafts killed the server with a SIGBUS in the
 Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` overflowed at 15; ReleaseFast has no overflow check and the fall-through `unreachable` ran off the function.
 Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
 Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
+
+## A Vulkan backend's MSL translator refused our kernels at eval (2026-10-10)
+
+Defect: Qwen3.5-0.8B on the mlx-omarchy Vulkan backend (RTX 5060 Ti) failed every request with a 500 (`MlxFailure` in prefill).
+Cause: `metalKernelsAvailable` was true on every non-CUDA backend, so our MSL kernels went to omarchy's MSL-subset translator, which refuses what it cannot translate only when the graph evaluates: no decline probe sees it, and the latched error fails the request.
+Fix: `metalKernelsAvailable` is true on Metal only; Vulkan runs MLX ops, like CUDA (Qwen3-1.7B decoded 3% faster without the translated kernels). MTP's off-by-default gate keys on the same predicate (`mtpAllowedByDefault`): it was CUDA-only, and a 9B Qwen3.5 decoded at a third of plain speed with MTP on Vulkan.
+Guard: `custom Metal kernels run on the Metal backend only` and `MTP is off by default where the Metal verify kernels cannot run` (both red on a non-CUDA Linux build).
