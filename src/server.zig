@@ -1267,6 +1267,13 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 /// closer is committed and the answer follows.
 const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
 
+/// GLM-5's thinking has no such line, and committed into its thought the model
+/// repeats it in the answer: GLM gets the closer alone.
+fn thinkBoundEarlyStop(config: ?*const model_mod.ModelConfig) []const u8 {
+    const c = config orelse return THINK_BOUND_EARLY_STOP;
+    return if (c.isGlm5()) "" else THINK_BOUND_EARLY_STOP;
+}
+
 /// No budget (< 0) still arms the bound at an unreachable limit: it exists to
 /// close a thought the loop guard convicts (`scheduler.loopRecoveryAction`).
 fn thinkBoundBudget(budget: i32) u32 {
@@ -1287,7 +1294,8 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
     if (opener == null and !opened) return null;
 
-    const stop_ids = tok.encode(allocator, THINK_BOUND_EARLY_STOP) catch return null;
+    const early_stop = thinkBoundEarlyStop(lm.config);
+    const stop_ids = (if (early_stop.len == 0) allocator.alloc(u32, 0) else tok.encode(allocator, early_stop)) catch return null;
     defer allocator.free(stop_ids);
     const sep_ids = tok.encode(allocator, "\n\n") catch return null;
     defer allocator.free(sep_ids);
@@ -27174,4 +27182,13 @@ test "MiniCPM-V 4.7: expanded image runs and canvas positions equal the processo
             try t.expectEqual(@as(i32, @intCast(w.integer)), mrope.pos.?[row * out.ids.len + k]);
         };
     }
+}
+
+test "think bound: GLM-5 closes the thought without Qwen's early-stop line" {
+    const t = std.testing;
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    try t.expectEqualStrings("", thinkBoundEarlyStop(&glm));
+    try t.expectEqualStrings(THINK_BOUND_EARLY_STOP, thinkBoundEarlyStop(&qwen));
+    try t.expectEqualStrings(THINK_BOUND_EARLY_STOP, thinkBoundEarlyStop(null));
 }
