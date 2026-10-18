@@ -588,9 +588,10 @@ const MtpMlp = union(enum) {
             },
             .nemotron_moe => |*nm| {
                 const arrs = [_]mlx.mlx_array{
-                    nm.router_w, nm.router_s, nm.router_b, nm.expert_bias,
-                    nm.fc1_w,    nm.fc1_s,    nm.fc1_b,    nm.fc2_w,
-                    nm.fc2_s,    nm.fc2_b,
+                    nm.router_w,     nm.router_s,     nm.router_b,     nm.expert_bias,
+                    nm.fc1_w,        nm.fc1_s,        nm.fc1_b,        nm.fc2_w,
+                    nm.fc2_s,        nm.fc2_b,        nm.fc1_latent_w, nm.fc1_latent_s,
+                    nm.fc1_latent_b, nm.fc2_latent_w, nm.fc2_latent_s, nm.fc2_latent_b,
                 };
                 for (arrs) |a| _ = mlx.mlx_array_free(a);
                 if (nm.shared) |sm| {
@@ -2656,8 +2657,10 @@ const NemotronMtpNames = struct {
 fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights, names: NemotronMtpNames) !MtpModel {
     const N = NemotronMtpNames;
     var kb: [256]u8 = undefined;
-    // The head's MoE runs the uniform expert path; a latent head would draft through the wrong projection.
-    if (weights.get(N.key(&kb, names.moe, "mixer.fc1_latent_proj.weight")) != null) return error.UnsupportedLatentMtpHead;
+    // A LatentMoE head runs its experts in the latent, which `nemotronMoe` does whenever
+    // `fc1_latent_w` is set. One projection without the other is a truncated checkpoint.
+    const has_latent = weights.get(N.key(&kb, names.moe, "mixer.fc1_latent_proj.weight")) != null;
+    if (has_latent != (weights.get(N.key(&kb, names.moe, "mixer.fc2_latent_proj.weight")) != null)) return error.MissingMtpWeight;
     const has_shared = weights.get(N.key(&kb, names.moe, "mixer.shared_experts.up_proj.weight")) != null;
     // Every tensor lands in a local that frees itself on error; `m` below is
     // built with no fallible call and takes them all over.
@@ -2671,6 +2674,10 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
     errdefer if (shared_up) |*l| l.deinit();
     var shared_down: ?QLinear = if (has_shared) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.shared_experts.down_proj"), s) else null;
     errdefer if (shared_down) |*l| l.deinit();
+    var lat1: ?QLinear = if (has_latent) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.fc1_latent_proj"), s) else null;
+    errdefer if (lat1) |*l| l.deinit();
+    var lat2: ?QLinear = if (has_latent) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.fc2_latent_proj"), s) else null;
+    errdefer if (lat2) |*l| l.deinit();
     // `[H, 2H]`: a bare dense key is pre-transposed for the plain-matmul arm,
     // a `.weight` + `.scales` triple stays quantized.
     var eh_proj: QLinear = if (weights.get(names.eh_proj) != null)
@@ -2739,6 +2746,12 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
             .fc2_s = fc2.s,
             .fc2_b = fc2.b,
             .shared = shared,
+            .fc1_latent_w = if (lat1) |l| l.w else mlx.mlx_array_new(),
+            .fc1_latent_s = if (lat1) |l| l.s else mlx.mlx_array_new(),
+            .fc1_latent_b = if (lat1) |l| l.b else mlx.mlx_array_new(),
+            .fc2_latent_w = if (lat2) |l| l.w else mlx.mlx_array_new(),
+            .fc2_latent_s = if (lat2) |l| l.s else mlx.mlx_array_new(),
+            .fc2_latent_b = if (lat2) |l| l.b else mlx.mlx_array_new(),
         } },
     };
 
@@ -2763,6 +2776,11 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
         if (nm.shared) |sm| {
             _ = mlx.mlx_vector_array_append_value(eval_vec, sm.up_w);
             _ = mlx.mlx_vector_array_append_value(eval_vec, sm.down_w);
+        }
+        if (nm.fc1_latent_w.ctx != null) {
+            _ = mlx.mlx_vector_array_append_value(eval_vec, nm.fc1_latent_w);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, nm.fc2_latent_w);
+            log.info("[mtp] Nemotron-H head is LatentMoE\n", .{});
         }
         _ = mlx.mlx_eval(eval_vec);
     }
@@ -4171,6 +4189,46 @@ test "mtp: a Nemotron-H head missing any one tensor fails to load and frees what
     };
     // Without the shared expert's up_proj the head is a valid no-shared-expert head.
     try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, "moe.mixer.shared_experts.up_proj.weight");
+}
+
+test "mtp: a latent Nemotron head loads, and one projection without the other is rejected" {
+    const C = HeadLoadLeakProbe.Case;
+    const cases = [_]C{
+        .{ .key = "eh_proj", .shape = &.{ 8, 16 } },
+        .{ .key = "enorm", .shape = &.{8} },
+        .{ .key = "hnorm", .shape = &.{8} },
+        .{ .key = "final_norm", .shape = &.{8} },
+        .{ .key = "attn.norm.weight", .shape = &.{8} },
+        .{ .key = "attn.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "attn.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "attn.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "attn.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "moe.norm.weight", .shape = &.{8} },
+        .{ .key = "moe.mixer.gate.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "moe.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
+        .{ .key = "moe.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 4 } },
+        .{ .key = "moe.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 4, 6 } },
+        .{ .key = "moe.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
+        .{ .key = "moe.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
+        // The routed experts run in the latent (4); the projections map H 8 to it and back.
+        .{ .key = "moe.mixer.fc1_latent_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "moe.mixer.fc2_latent_proj.weight", .shape = &.{ 8, 4 } },
+    };
+    const L = struct {
+        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
+            return loadNemotronMtp(a, s, w, .sevren);
+        }
+    };
+    // Either latent projection alone is a truncated checkpoint, so dropping one fails like any other tensor.
+    try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, "moe.mixer.shared_experts.up_proj.weight");
+
+    const s = mlx.gpuStream();
+    var w = try HeadLoadLeakProbe.build(&cases, cases.len, s);
+    defer w.deinit();
+    var m = try L.load(testing.allocator, s, &w);
+    defer m.deinit();
+    const nm = &m.mlp.nemotron_moe;
+    try testing.expect(nm.fc1_latent_w.ctx != null and nm.fc2_latent_w.ctx != null);
 }
 
 test "mtp: a Hy3 head missing any one tensor fails to load and frees what it loaded" {
