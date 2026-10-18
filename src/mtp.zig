@@ -35,6 +35,7 @@ const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
 const ane_mod = @import("ane.zig");
+const sushi_pack = @import("sushi_pack.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -828,19 +829,23 @@ pub const MtpModel = struct {
                 self.mlp.moe.route_norm = cfg.moe_route_norm;
                 self.mlp.moe.route_scale = cfg.router_scaling_factor;
             }
+            const had_err = mlx.errorPending();
             self.buildDraftHead(target) catch |err| {
                 log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
             };
             self.maybeBuildDraftRerank(target);
+            mlx.dropLatchedErrorUnless(had_err); // best effort: never the first request's MlxFailure
             return;
         }
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
         if (!fcMatchesHidden(&self.fc, cfg.hidden_size)) return error.MtpTargetMismatch;
 
+        const had_err = mlx.errorPending();
         self.buildDraftHead(target) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
         self.maybeBuildDraftRerank(target);
+        mlx.dropLatchedErrorUnless(had_err); // best effort: never the first request's MlxFailure
         // NOTE (2026-07-13): mlx_compile'ing the offset-free front/back
         // halves of the seq-1 draft step (the compileMoeRouting pattern,
         // weights captured via payload) was built, verified equivalent at
@@ -869,6 +874,7 @@ pub const MtpModel = struct {
         if (bits == 0) return;
         if (target.lm_head_s.ctx == null) return; // dense bf16 head — nothing to shrink
         if (target.rht != null) return; // a requantized copy would need the rotated input at every draft site
+        if (sushi_pack.isRowScaledFp8(target.lm_head_w, target.lm_head_s)) return; // e4m3 head: mlx dequantize cannot read it
         // The head's TRUE params, not the trunk global — mixed checkpoints
         // (hy_v3: 8-bit head over a 2-bit trunk) diverge, and requantizing
         // with the wrong source bits reads garbage.
@@ -922,6 +928,7 @@ pub const MtpModel = struct {
     fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
         const mode = draftRerankMode();
         if (mode == .off) return;
+        if (sushi_pack.isRowScaledFp8(target.lm_head_w, target.lm_head_s)) return; // e4m3 head: no affine rows to gather
         if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
         const w_shape = mlx.getShape(target.lm_head_w);
         if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
@@ -1055,6 +1062,7 @@ pub const RerankCoarse = struct {
 pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
     if (bits == 0) return null;
     if (target.rht != null) return null;
+    if (sushi_pack.isRowScaledFp8(target.lm_head_w, target.lm_head_s)) return null; // e4m3 head: no affine rows to gather
     const w_shape = mlx.getShape(target.lm_head_w);
     if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return null;
     // A dense bf16 head ([V, H], 16 bits) always reads more than the coarse copy.
@@ -1131,46 +1139,15 @@ pub fn fullReadoutArgmax(
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !mlx.mlx_array {
-    const logits = try fullReadoutLogits(s, target, x);
+    const logits = try target.lmHeadForeign(x);
     defer _ = mlx.mlx_array_free(logits);
     return maskAndArgmax(s, logits, suppress_mask);
-}
-
-/// The trunk lm_head over `x` `[.., H]`.
-fn fullReadoutLogits(s: mlx.mlx_stream, target: *Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-    var logits = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(logits);
-    if (target.rht != null) {
-        _ = mlx.mlx_array_free(logits);
-        logits = try target.hadamardLmHead(x);
-    } else if (target.lm_head_s.ctx == null) {
-        const axes = [_]c_int{ 1, 0 };
-        var wt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wt);
-        try mlx.check(mlx.mlx_transpose_axes(&wt, target.lm_head_w, &axes, 2, s));
-        try mlx.check(mlx.mlx_matmul(&logits, x, wt, s));
-    } else {
-        const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
-        try mlx.check(mlx.mlx_quantized_matmul(
-            &logits,
-            x,
-            target.lm_head_w,
-            target.lm_head_s,
-            target.lm_head_b,
-            true,
-            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
-            mlx.mlx_optional_int.some(@intCast(qp.bits)),
-            qp.mode.cstr(),
-            s,
-        ));
-    }
-    return logits;
 }
 
 /// Row i of `out` = the top-32 of the trunk head's exact readout of `x[i]` (`[N,1,H]`), so
 /// nothing is re-scored. False = the top-32 kernel declined.
 pub fn exactShortlistsBatched(s: mlx.mlx_stream, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array, out: []Shortlist) !bool {
-    var logits = try fullReadoutLogits(s, target, x);
+    var logits = try target.lmHeadForeign(x);
     defer _ = mlx.mlx_array_free(logits);
     try rerankMaskCoarse(s, &logits, suppress_mask);
     const vocab = mlx.getShape(logits)[2];
@@ -2945,38 +2922,7 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
         ));
         return out;
     }
-    var out = mlx.mlx_array_new();
-    if (target.lm_head_s.ctx == null) {
-        // Dense bf16 lm_head is stored [vocab, hidden]; contract via lazy transpose.
-        const axes = [_]c_int{ 1, 0 };
-        var wt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wt);
-        try mlx.check(mlx.mlx_transpose_axes(&wt, target.lm_head_w, &axes, 2, s));
-        try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
-        return out;
-    }
-    // Per-WEIGHT quant params: mixed checkpoints override the head's width
-    // (hy_v3 2-bit trunk ships an 8-bit lm_head — the global bits crashed the
-    // whole process in mlx's shape check, live 2026-07-14). Non-affine trunks
-    // keep the config fallback.
-    if (target.rht != null) {
-        _ = mlx.mlx_array_free(out);
-        return target.hadamardLmHead(x);
-    }
-    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
-    try mlx.check(mlx.mlx_quantized_matmul(
-        &out,
-        x,
-        target.lm_head_w,
-        target.lm_head_s,
-        target.lm_head_b,
-        true,
-        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
-        mlx.mlx_optional_int.some(@intCast(qp.bits)),
-        qp.mode.cstr(),
-        s,
-    ));
-    return out;
+    return target.lmHeadForeign(x);
 }
 
 /// The trunk lm_head's TRUE quant params, via the same dtype-gated resolver
@@ -6678,6 +6624,49 @@ test "draft rerank on a dense bf16 head: shortlisted rows re-score to the full r
     try mlx.check(mlx.mlx_array_eval(ids));
     const pid = mlx.mlx_array_data_int32(ids).?;
     for (0..32) |i| try testing.expectApproxEqAbs(ex[@intCast(pid[i])], got[i], 1e-2);
+    var eb: [512]u8 = undefined;
+    if (mlx.takeError(&eb)) |m| {
+        std.debug.print("latched: {s}\n", .{m});
+        return error.MlxErrorLatched;
+    }
+}
+
+test "mtp: a row-scaled FP8 trunk head reads through fp8Linear and latches nothing at bind" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    // e4m3 0x38 is 1.0, so row r of the head is its two 128-wide block scales.
+    const V: usize = @intCast(fx.vocab);
+    const H: usize = @intCast(fx.hidden);
+    const codes = try allocator.alloc(u8, V * H);
+    defer allocator.free(codes);
+    @memset(codes, 0x38);
+    const sc = try allocator.alloc(f32, V * (H / 128));
+    defer allocator.free(sc);
+    for (sc, 0..) |*v, i| v.* = 0.125 * @as(f32, @floatFromInt(1 + (i / 2 + i % 2) % 4));
+    _ = mlx.mlx_array_free(fx.xfm.lm_head_w);
+    fx.xfm.lm_head_w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ fx.vocab, fx.hidden }, 2, .uint8);
+    _ = mlx.mlx_array_free(fx.xfm.lm_head_s);
+    fx.xfm.lm_head_s = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{ fx.vocab, @intCast(H / 128) }, 2, .float32);
+
+    try testing.expect(buildRerankCoarse(s, &fx.xfm, 2) == null);
+
+    const x = try fx.randomX(s, 3);
+    defer _ = mlx.mlx_array_free(x);
+    const logits = try fx.xfm.lmHeadForeign(x);
+    defer _ = mlx.mlx_array_free(logits);
+    const got = try readRow(allocator, s, logits, V);
+    defer allocator.free(got);
+    const xr = try readRow(allocator, s, x, H);
+    defer allocator.free(xr);
+    var half: [2]f32 = .{ 0, 0 };
+    for (xr, 0..) |v, k| half[k / 128] += v;
+    for (got, 0..) |g, r| try testing.expectApproxEqAbs(sc[2 * r] * half[0] + sc[2 * r + 1] * half[1], g, 0.0625);
+
     var eb: [512]u8 = undefined;
     if (mlx.takeError(&eb)) |m| {
         std.debug.print("latched: {s}\n", .{m});
