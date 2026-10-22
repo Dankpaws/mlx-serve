@@ -16956,9 +16956,10 @@ pub fn qkvAttnVerifyKernel(
     return out;
 }
 
-// ── matmul2d packed attention (t_q 1..8) ──
+// ── matmul2d packed attention (t_q 1..16) ──
 //
-// One threadgroup (NTH threads) per (kv head, kv split). Per 32-token page every thread loads a
+// One threadgroup (NTH threads) per (kv head, row block, kv split); a block holds at most
+// QKV_MPP_BLOCK_ROWS of the GQA x t_q query rows, so wide verifies fit the 32 KiB budget. Per 32-token page every thread loads a
 // slice of the packed K/V rows (the next page's bytes are already in registers), K is dequantized
 // into a threadgroup tile, QK runs through the matmul2d tensor op, the online softmax runs one
 // row per simdgroup, V is dequantized into the same tile and PV accumulates into a cooperative
@@ -16967,6 +16968,8 @@ pub fn qkvAttnVerifyKernel(
 const QKV_MPP_PAGE: c_int = 32;
 const QKV_MPP_MAX_SPLITS: c_int = 128;
 const QKV_MPP_PAGES_PER_SPLIT: c_int = 2;
+const QKV_MPP_BLOCK_ROWS: c_int = 48;
+pub const QKV_MPP_MAX_TQ: c_int = 16;
 
 const QKV_MPP_KERNEL_SOURCE =
     \\using namespace mpp::tensor_ops;
@@ -16984,7 +16987,9 @@ const QKV_MPP_KERNEL_SOURCE =
     \\const uint tid = thread_position_in_threadgroup.x;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const uint hkv = threadgroup_position_in_grid.y;
+    \\const uint yb = threadgroup_position_in_grid.y;
+    \\const uint hkv = yb / NRB;
+    \\const uint rb = yb % NRB;
     \\const uint split = threadgroup_position_in_grid.z;
     \\const uint nsplit = threadgroups_per_grid.z;
     \\const int Tk = tk[0];
@@ -17044,7 +17049,7 @@ const QKV_MPP_KERNEL_SOURCE =
     \\constexpr auto pv_desc = matmul2d_descriptor(M, D, N, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     \\matmul2d<qk_desc, execution_simdgroups<NTH / 32>> qk;
     \\matmul2d<pv_desc, execution_simdgroups<NTH / 32>> pv;
-    \\auto qt = tensor((device T*)q + (long)hkv * M * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    \\auto qt = tensor((device T*)q + (long)yb * M * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     \\auto tt = tensor(tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     \\auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
     \\auto q0 = qt.template slice<D, M>(0, 0);
@@ -17067,7 +17072,8 @@ const QKV_MPP_KERNEL_SOURCE =
     \\
     \\  for (int rr = 0; rr < RPS; ++rr) {
     \\    const int m = int(sg) * RPS + rr;
-    \\    const int lim = m < MR ? Tk - TQ + 1 + (m % TQ) : Tk;
+    \\    const int gm = int(rb) * M + m;
+    \\    const int lim = gm < MR ? Tk - TQ + 1 + (gm % TQ) : Tk;
     \\    float sv[(N + 31) / 32];
     \\    float lmax = -INFINITY;
     \\    for (int b = 0; b < (N + 31) / 32; ++b) {
@@ -17105,7 +17111,7 @@ const QKV_MPP_KERNEL_SOURCE =
     \\  pv.run(p0, t0, running);
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
-    \\const long slot = (long)hkv * nsplit + split;
+    \\const long slot = (long)yb * nsplit + split;
     \\auto target = tensor(o_out + slot * M * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     \\running.store(target.template slice<D, M>(0, 0));
     \\if (tid < uint(M)) {
@@ -17121,13 +17127,15 @@ const QKV_MPP_MERGE_SOURCE =
     \\const uint row = threadgroup_position_in_grid.y;
     \\const uint hkv = row / MR;
     \\const uint r = row % MR;
+    \\const uint blk = hkv * NRB + r / M;
+    \\const uint rr = r % M;
     \\const uint sg = t / 32, lane = t % 32;
     \\const int NS = ns[0];
     \\threadgroup float red_m[8];
     \\threadgroup float red_l[8];
     \\threadgroup float red_o[8 * D];
     \\float mloc = -INFINITY;
-    \\for (int s = int(sg); s < NS; s += 8) mloc = max(mloc, m_in[((long)hkv * NS + s) * M + r]);
+    \\for (int s = int(sg); s < NS; s += 8) mloc = max(mloc, m_in[((long)blk * NS + s) * M + rr]);
     \\mloc = simd_max(mloc);
     \\if (lane == 0) red_m[sg] = mloc;
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -17136,7 +17144,7 @@ const QKV_MPP_MERGE_SOURCE =
     \\float L = 0.0f;
     \\float O[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     \\for (int s = int(sg); s < NS; s += 8) {
-    \\  const long b = ((long)hkv * NS + s) * M + r;
+    \\  const long b = ((long)blk * NS + s) * M + rr;
     \\  const float w = metal::exp(m_in[b] - mmax);
     \\  L += l_in[b] * w;
     \\  const device float4* op = (const device float4*)(o_in + b * D + lane * 8);
@@ -17157,11 +17165,11 @@ const QKV_MPP_MERGE_SOURCE =
 var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 var qkv_mpp_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 const QkvMppCfgKey = struct { hq: c_int, dk: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, nsplit: c_int, dtype: mlx.mlx_dtype, nth: c_int };
-var qkv_mpp_cfgs: [@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
-var qkv_mpp_cfg_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppCfgKey = @splat(std.mem.zeroes(QkvMppCfgKey));
+var qkv_mpp_cfgs: [@intCast(QKV_MPP_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var qkv_mpp_cfg_keys: [@intCast(QKV_MPP_MAX_TQ + 1)]QkvMppCfgKey = @splat(std.mem.zeroes(QkvMppCfgKey));
 const QkvMppMergeKey = struct { rows: c_int, mr: c_int, m: c_int, dtype: mlx.mlx_dtype };
-var qkv_mpp_merge_cfgs: [@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
-var qkv_mpp_merge_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppMergeKey = @splat(std.mem.zeroes(QkvMppMergeKey));
+var qkv_mpp_merge_cfgs: [@intCast(QKV_MPP_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var qkv_mpp_merge_keys: [@intCast(QKV_MPP_MAX_TQ + 1)]QkvMppMergeKey = @splat(std.mem.zeroes(QkvMppMergeKey));
 var qkv_mpp_engaged: bool = false;
 
 /// The page loop is latency-bound: wide groups win while each split walks a few pages,
@@ -17181,8 +17189,8 @@ pub fn qkvMppSplits(t_k: c_int) c_int {
     return std.math.clamp(@divTrunc(pages, QKV_MPP_PAGES_PER_SPLIT), 1, QKV_MPP_MAX_SPLITS);
 }
 
-/// Folds the [Hkv, NS, M(, D)] split partials into a typed [Hkv * real_rows, D] array.
-fn qkvMppMerge(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, slot: usize, h_kv: c_int, real_rows: c_int, m_rows: c_int, nsplit: c_int, dk: c_int, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+/// Folds the [Hkv * NRB, NS, M(, D)] split partials into a typed [Hkv * real_rows, D] array.
+fn qkvMppMerge(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, slot: usize, h_kv: c_int, real_rows: c_int, m_rows: c_int, nrb: c_int, nsplit: c_int, dk: c_int, qdt: mlx.mlx_dtype) !mlx.mlx_array {
     if (mlx.mlx_vector_array_size(outputs_vec) != 3) return error.MetalKernelBadOutputCount;
     if (qkv_mpp_merge_kernel_cached == null) {
         const input_names = [_][*:0]const u8{ "m_in", "l_in", "o_in", "ns" };
@@ -17208,6 +17216,7 @@ fn qkvMppMerge(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, slot: usize
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "MR", real_rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "M", m_rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "D", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NRB", nrb));
         qkv_mpp_merge_cfgs[slot] = config;
         qkv_mpp_merge_keys[slot] = key;
     }
@@ -17236,7 +17245,7 @@ fn qkvMppMerge(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, slot: usize
     return out;
 }
 
-/// Packed-KV attention through matmul2d, t_q 1..8, no mask or end-aligned causal. Null = declined.
+/// Packed-KV attention through matmul2d, t_q 1..16, no mask or end-aligned causal. Null = declined.
 pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
     // Same machines as the verify-qmm matmul2d tile: M5 matrix units or M4-family shader code.
     if (verifyQmmTile() == .off) return null;
@@ -17245,7 +17254,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     if (mlx.mlx_array_ndim(q_in) != 4) return null;
     const qs = mlx.getShape(q_in);
     const t_q: c_int = qs[2];
-    if (qs[0] != 1 or t_q < 1 or t_q > QKV_VERIFY_MAX_TQ) return null;
+    if (qs[0] != 1 or t_q < 1 or t_q > QKV_MPP_MAX_TQ) return null;
     const causal = std.mem.eql(u8, mask_mode, "causal");
     if (!causal and !(t_q == 1 and mask_mode.len == 0)) return null;
     const qdt = mlx.mlx_array_dtype(q_in);
@@ -17262,7 +17271,6 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const h_kv: c_int = ks[1];
     if (h_kv <= 0 or @rem(h_q, h_kv) != 0 or vs[1] != h_kv or vs[2] != ks[2] or ks[0] != 1) return null;
     const gqa: c_int = @divExact(h_q, h_kv);
-    if (@divTrunc(gqa * t_q + 7, 8) * 8 > 56) return null; // past 56 padded rows the threadgroup arrays exceed Metal's 32 KiB
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
 
@@ -17279,19 +17287,20 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     }
     const nsplit = qkvMppSplits(t_k);
     const real_rows: c_int = gqa * t_q;
-    const m_rows: c_int = @divTrunc(real_rows + 7, 8) * 8;
+    const m_rows: c_int = @min(QKV_MPP_BLOCK_ROWS, @divTrunc(real_rows + 7, 8) * 8);
+    const nrb: c_int = @divTrunc(real_rows + m_rows - 1, m_rows);
     const slot: usize = @intCast(t_q);
     const nth = qkvMppThreads(t_k);
     const key = QkvMppCfgKey{ .hq = h_q, .dk = dk, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .nsplit = nsplit, .dtype = qdt, .nth = nth };
     if (qkv_mpp_cfgs[slot] == null or !std.meta.eql(qkv_mpp_cfg_keys[slot], key)) {
         if (qkv_mpp_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
-        const ml_shape = [_]c_int{ h_kv, nsplit, m_rows };
-        const o_shape = [_]c_int{ h_kv, nsplit, m_rows, dk };
+        const ml_shape = [_]c_int{ h_kv * nrb, nsplit, m_rows };
+        const o_shape = [_]c_int{ h_kv * nrb, nsplit, m_rows, dk };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nth, h_kv, nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nth, h_kv * nrb, nsplit));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, nth, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(view.bits)));
@@ -17301,11 +17310,13 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TQ", t_q));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "MPAD", m_rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NTH", nth));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NRB", nrb));
         qkv_mpp_cfgs[slot] = config;
         qkv_mpp_cfg_keys[slot] = key;
     }
 
-    // [1, Hq, TQ, D] is already (kv head, group head, row)-major: [Hkv, real_rows, D], zero-padded.
+    // [1, Hq, TQ, D] is already (kv head, group head, row)-major: [Hkv, real_rows, D], zero-padded
+    // to whole blocks and viewed as [Hkv * NRB, M, D].
     var q3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(q3);
     const q3_shape = [_]c_int{ h_kv, real_rows, dk };
@@ -17317,12 +17328,16 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
         defer _ = mlx.mlx_array_free(zero);
         const axes = [_]c_int{1};
         const lo = [_]c_int{0};
-        const hi = [_]c_int{m_rows - real_rows};
+        const hi = [_]c_int{nrb * m_rows - real_rows};
         try mlx.check(mlx.mlx_pad(&qp, q3, &axes, 1, &lo, 1, &hi, 1, zero, "constant", s));
     }
+    var qb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qb);
+    const qb_shape = [_]c_int{ h_kv * nrb, m_rows, dk };
+    try mlx.check(mlx.mlx_reshape(&qb, qp, &qb_shape, 3, s));
     var q = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(q);
-    try mlx.check(mlx.mlx_contiguous(&q, qp, false, s));
+    try mlx.check(mlx.mlx_contiguous(&q, qb, false, s));
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -17337,7 +17352,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, qkv_mpp_kernel_cached.?, inputs_vec, qkv_mpp_cfgs[slot].?, s));
 
-    const o_t = try qkvMppMerge(s, outputs_vec, slot, h_kv, real_rows, m_rows, nsplit, dk, qdt);
+    const o_t = try qkvMppMerge(s, outputs_vec, slot, h_kv, real_rows, m_rows, nrb, nsplit, dk, qdt);
     defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -17409,7 +17424,7 @@ fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
 /// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
 /// kills the whole width class on every machine.
 fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
+    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_MPP_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();
@@ -47226,10 +47241,12 @@ test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many split
     try qkvVerParityCaseWith(32, 2, 256, 8, 33000, 1, true); // long enough for the narrow threadgroups
 }
 
-test "qkv matmul2d kernel declines rows past its 32 KiB threadgroup budget (GQA 8 x t_q 8)" {
+test "qkv matmul2d kernel parity: rows past one threadgroup's budget run in row blocks (t_q to 16)" {
     if (verifyQmmTile() == .off) return error.SkipZigTest;
-    try testing.expectError(error.KernelDeclined, qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true));
-    try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 7, true);
+    try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true); // GQA 8 x 8 = 64 rows
+    for ([_]c_int{ 4, 6, 9, 15, 16 }) |tq| try qkvVerParityCaseWith(32, 2, 256, 8, 3000, tq, true); // GQA 16
+    try qkvVerParityCaseWith(24, 4, 256, 4, 700, 16, true);
+    for ([_]c_int{ 6, 15 }) |tq| try qkvVerParityCaseWith(32, 2, 256, 8, 40000, tq, true); // narrow threadgroups x row blocks
 }
 
 test "qkvMppWins: the matmul2d window needs rows or length" {
@@ -47609,8 +47626,8 @@ test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
     // serving the TQ-wide packed kernel — never the composed chain.
     try testing.expect(!kvAttnVerifyEligible(&view_with, 1)); // decode belongs to the decode kernel
     try testing.expect(kvAttnVerifyEligible(&view_with, 2));
-    try testing.expect(kvAttnVerifyEligible(&view_with, QKV_VERIFY_MAX_TQ));
-    try testing.expect(!kvAttnVerifyEligible(&view_with, QKV_VERIFY_MAX_TQ + 1)); // prefill chunks stay dense
+    try testing.expect(kvAttnVerifyEligible(&view_with, QKV_MPP_MAX_TQ));
+    try testing.expect(!kvAttnVerifyEligible(&view_with, QKV_MPP_MAX_TQ + 1)); // prefill chunks stay dense
     try testing.expect(!kvAttnVerifyEligible(&view_short, 4)); // below the kv floor
     try testing.expect(!kvAttnVerifyEligible(&view_without, 4));
 }
