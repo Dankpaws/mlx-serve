@@ -16404,7 +16404,7 @@ pub fn qkvAttnDecodeKernel(
     if (!qkvDecKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
     if (!qkvVerifyForced() and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4 and
-        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]))
+        qkvMppWins(qkvMppTile(), mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]))
     {
         if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
     }
@@ -16832,7 +16832,7 @@ pub fn qkvAttnVerifyKernel(
     mask_mode: []const u8,
 ) !?mlx.mlx_array {
     if (!qkvVerifyForced() and view.has_quant_triple and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4) {
-        if (qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2])) {
+        if (qkvMppWins(qkvMppTile(), mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2])) {
             if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
         }
     }
@@ -16967,8 +16967,9 @@ pub fn qkvAttnVerifyKernel(
 // one dispatch. Structure after Inco Splash's q8 attention tile (Apache-2.0, see NOTICE).
 const QKV_MPP_PAGE: c_int = 32;
 const QKV_MPP_MAX_SPLITS: c_int = 128;
-const QKV_MPP_PAGES_PER_SPLIT: c_int = 2;
 const QKV_MPP_BLOCK_ROWS: c_int = 48;
+// The M4-family tile keeps one block, declined past 56 padded rows (the pre-row-block budget).
+const QKV_MPP_SHADER_MAX_ROWS: c_int = 56;
 pub const QKV_MPP_MAX_TQ: c_int = 16;
 
 const QKV_MPP_KERNEL_SOURCE =
@@ -17164,7 +17165,7 @@ const QKV_MPP_MERGE_SOURCE =
 
 var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 var qkv_mpp_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
-const QkvMppCfgKey = struct { hq: c_int, dk: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, nsplit: c_int, dtype: mlx.mlx_dtype, nth: c_int };
+const QkvMppCfgKey = struct { hq: c_int, dk: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, nsplit: c_int, dtype: mlx.mlx_dtype, nth: c_int, m: c_int };
 var qkv_mpp_cfgs: [@intCast(QKV_MPP_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 var qkv_mpp_cfg_keys: [@intCast(QKV_MPP_MAX_TQ + 1)]QkvMppCfgKey = @splat(std.mem.zeroes(QkvMppCfgKey));
 const QkvMppMergeKey = struct { rows: c_int, mr: c_int, m: c_int, dtype: mlx.mlx_dtype };
@@ -17172,21 +17173,40 @@ var qkv_mpp_merge_cfgs: [@intCast(QKV_MPP_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel
 var qkv_mpp_merge_keys: [@intCast(QKV_MPP_MAX_TQ + 1)]QkvMppMergeKey = @splat(std.mem.zeroes(QkvMppMergeKey));
 var qkv_mpp_engaged: bool = false;
 
+// The decode gate, split length, threadgroup width and row blocks were tuned on the M5 Ultra
+// (`.nax`). The M4 family runs this kernel in shader code (`.shader`), unmeasured with these
+// changes, so it keeps the values measured on an M4 Max before them: decode from 16,384 keys,
+// 8 pages per split, 256 threads, one block of at most 56 rows, verify widths to 8.
+
+/// Test seam: the tile whose defaults the packed kernel uses (null = this machine's). It only
+/// picks the constants; the kernel still needs a real matmul2d tile.
+pub var qkv_mpp_tile_override: ?VqmmTile = null;
+
+fn qkvMppTile() VqmmTile {
+    return qkv_mpp_tile_override orelse verifyQmmTile();
+}
+
 /// The page loop is latency-bound: wide groups win while each split walks a few pages,
 /// narrow ones (more groups resident per core) once the splits get long.
-fn qkvMppThreads(t_k: c_int) c_int {
-    return if (t_k < 32768) 256 else 128;
+fn qkvMppThreads(tile: VqmmTile, t_k: c_int) c_int {
+    return if (tile == .nax and t_k >= 32768) 128 else 256;
 }
 
-pub fn qkvMppWins(t_q: c_int, t_k: c_int) bool {
+pub fn qkvMppWins(tile: VqmmTile, t_q: c_int, t_k: c_int) bool {
     if (t_q >= 4) return t_k >= 2048;
     if (t_q >= 2) return t_k >= 8192;
-    return t_k >= 2048;
+    return t_k >= @as(c_int, if (tile == .nax) 2048 else 16384);
 }
 
-pub fn qkvMppSplits(t_k: c_int) c_int {
+/// Widest verify the packed path serves: row blocks go to 16 rows only where they were measured.
+pub fn qkvMppMaxTq(tile: VqmmTile) c_int {
+    return if (tile == .nax) QKV_MPP_MAX_TQ else QKV_VERIFY_MAX_TQ;
+}
+
+pub fn qkvMppSplits(tile: VqmmTile, t_k: c_int) c_int {
     const pages = @divTrunc(t_k + QKV_MPP_PAGE - 1, QKV_MPP_PAGE);
-    return std.math.clamp(@divTrunc(pages, QKV_MPP_PAGES_PER_SPLIT), 1, QKV_MPP_MAX_SPLITS);
+    const per_split: c_int = if (tile == .nax) 2 else 8;
+    return std.math.clamp(@divTrunc(pages, per_split), 1, QKV_MPP_MAX_SPLITS);
 }
 
 /// Folds the [Hkv * NRB, NS, M(, D)] split partials into a typed [Hkv * real_rows, D] array.
@@ -17249,12 +17269,13 @@ fn qkvMppMerge(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, slot: usize
 pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
     // Same machines as the verify-qmm matmul2d tile: M5 matrix units or M4-family shader code.
     if (verifyQmmTile() == .off) return null;
+    const tile = qkvMppTile();
     if (!view.has_quant_triple or view.group_size == 0) return null;
     if (view.bits != 4 and view.bits != 8) return null;
     if (mlx.mlx_array_ndim(q_in) != 4) return null;
     const qs = mlx.getShape(q_in);
     const t_q: c_int = qs[2];
-    if (qs[0] != 1 or t_q < 1 or t_q > QKV_MPP_MAX_TQ) return null;
+    if (qs[0] != 1 or t_q < 1 or t_q > qkvMppMaxTq(tile)) return null;
     const causal = std.mem.eql(u8, mask_mode, "causal");
     if (!causal and !(t_q == 1 and mask_mode.len == 0)) return null;
     const qdt = mlx.mlx_array_dtype(q_in);
@@ -17273,6 +17294,9 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const gqa: c_int = @divExact(h_q, h_kv);
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
+    const real_rows: c_int = gqa * t_q;
+    const padded_rows: c_int = @divTrunc(real_rows + 7, 8) * 8;
+    if (tile != .nax and padded_rows > QKV_MPP_SHADER_MAX_ROWS) return null;
 
     if (qkv_mpp_kernel_cached == null) {
         const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
@@ -17285,13 +17309,12 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
         if (kk.ctx == null) return null;
         qkv_mpp_kernel_cached = kk;
     }
-    const nsplit = qkvMppSplits(t_k);
-    const real_rows: c_int = gqa * t_q;
-    const m_rows: c_int = @min(QKV_MPP_BLOCK_ROWS, @divTrunc(real_rows + 7, 8) * 8);
+    const nsplit = qkvMppSplits(tile, t_k);
+    const m_rows: c_int = if (tile == .nax) @min(QKV_MPP_BLOCK_ROWS, padded_rows) else padded_rows;
     const nrb: c_int = @divTrunc(real_rows + m_rows - 1, m_rows);
     const slot: usize = @intCast(t_q);
-    const nth = qkvMppThreads(t_k);
-    const key = QkvMppCfgKey{ .hq = h_q, .dk = dk, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .nsplit = nsplit, .dtype = qdt, .nth = nth };
+    const nth = qkvMppThreads(tile, t_k);
+    const key = QkvMppCfgKey{ .hq = h_q, .dk = dk, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .nsplit = nsplit, .dtype = qdt, .nth = nth, .m = m_rows };
     if (qkv_mpp_cfgs[slot] == null or !std.meta.eql(qkv_mpp_cfg_keys[slot], key)) {
         if (qkv_mpp_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -17418,13 +17441,13 @@ fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
     return ks[2] >= kvAttnFusedMinTk();
 }
 
-/// Verify-width packed-attention gate (Phase 2): T_q 2..8 served by
+/// Verify-width packed-attention gate (Phase 2): T_q 2..qkvMppMaxTq served by
 /// `qkvAttnVerifyKernel`, same triple + per-layer kv floor as decode.
 /// Wider multi-token forwards (real prefill chunks) stay on dense SDPA;
 /// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
 /// kills the whole width class on every machine.
 fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_MPP_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
+    if (!(view.has_quant_triple and t_q >= 2 and t_q <= qkvMppMaxTq(qkvMppTile()) and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();
@@ -47242,19 +47265,41 @@ test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many split
 }
 
 test "qkv matmul2d kernel parity: rows past one threadgroup's budget run in row blocks (t_q to 16)" {
-    if (verifyQmmTile() == .off) return error.SkipZigTest;
+    if (verifyQmmTile() != .nax) return error.SkipZigTest; // row blocks are the M5 tile's
     try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true); // GQA 8 x 8 = 64 rows
     for ([_]c_int{ 4, 6, 9, 15, 16 }) |tq| try qkvVerParityCaseWith(32, 2, 256, 8, 3000, tq, true); // GQA 16
     try qkvVerParityCaseWith(24, 4, 256, 4, 700, 16, true);
     for ([_]c_int{ 6, 15 }) |tq| try qkvVerParityCaseWith(32, 2, 256, 8, 40000, tq, true); // narrow threadgroups x row blocks
 }
 
+test "qkv matmul2d kernel parity: the M4 tile's defaults (one block to 56 rows, t_q to 8)" {
+    if (verifyQmmTile() == .off) return error.SkipZigTest;
+    qkv_mpp_tile_override = .shader; // the M4 constants, run on whatever matmul2d tile this is
+    defer qkv_mpp_tile_override = null;
+    try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 7, true); // GQA 8 x 7 = 56 rows, one block
+    try qkvVerParityCaseWith(24, 4, 256, 8, 3000, 8, true);
+    try qkvVerParityCaseWith(32, 2, 256, 8, 33000, 1, true); // 256 threads, 8-page splits
+    try testing.expectError(error.KernelDeclined, qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true)); // 64 rows
+    try testing.expectError(error.KernelDeclined, qkvVerParityCaseWith(6, 1, 256, 8, 3000, 9, true)); // t_q 9
+}
+
 test "qkvMppWins: the matmul2d window needs rows or length" {
-    try testing.expect(qkvMppWins(4, 2048));
-    try testing.expect(!qkvMppWins(2, 4096));
-    try testing.expect(qkvMppWins(2, 8192));
-    try testing.expect(!qkvMppWins(1, 1024));
-    try testing.expect(qkvMppWins(1, 2048));
+    try testing.expect(qkvMppWins(.nax, 4, 2048));
+    try testing.expect(!qkvMppWins(.nax, 2, 4096));
+    try testing.expect(qkvMppWins(.nax, 2, 8192));
+    try testing.expect(!qkvMppWins(.nax, 1, 1024));
+    try testing.expect(qkvMppWins(.nax, 1, 2048));
+    // The M4 tile keeps the M4 Max decode window; the verify widths match.
+    try testing.expect(!qkvMppWins(.shader, 1, 8192));
+    try testing.expect(qkvMppWins(.shader, 1, 16384));
+    try testing.expect(qkvMppWins(.shader, 4, 2048));
+    try testing.expectEqual(@as(c_int, 16), qkvMppMaxTq(.nax));
+    try testing.expectEqual(@as(c_int, 8), qkvMppMaxTq(.shader));
+    try testing.expectEqual(@as(c_int, 8), qkvMppMaxTq(.off));
+    try testing.expectEqual(@as(c_int, 64), qkvMppSplits(.nax, 4096));
+    try testing.expectEqual(@as(c_int, 16), qkvMppSplits(.shader, 4096));
+    try testing.expectEqual(@as(c_int, 128), qkvMppThreads(.nax, 32768));
+    try testing.expectEqual(@as(c_int, 256), qkvMppThreads(.shader, 32768));
 }
 
 test "qkv verify kernel serves by default only the row counts that stay in registers" {
@@ -47626,8 +47671,9 @@ test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
     // serving the TQ-wide packed kernel — never the composed chain.
     try testing.expect(!kvAttnVerifyEligible(&view_with, 1)); // decode belongs to the decode kernel
     try testing.expect(kvAttnVerifyEligible(&view_with, 2));
-    try testing.expect(kvAttnVerifyEligible(&view_with, QKV_MPP_MAX_TQ));
-    try testing.expect(!kvAttnVerifyEligible(&view_with, QKV_MPP_MAX_TQ + 1)); // prefill chunks stay dense
+    const max_tq = qkvMppMaxTq(verifyQmmTile());
+    try testing.expect(kvAttnVerifyEligible(&view_with, max_tq));
+    try testing.expect(!kvAttnVerifyEligible(&view_with, max_tq + 1)); // prefill chunks stay dense
     try testing.expect(!kvAttnVerifyEligible(&view_short, 4)); // below the kv floor
     try testing.expect(!kvAttnVerifyEligible(&view_without, 4));
 }
